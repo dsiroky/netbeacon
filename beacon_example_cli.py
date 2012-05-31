@@ -2,4 +2,5 @@
 
 import beacon
 
-print(beacon.find_server(12000, b"abc"))
+print("single: %r" % beacon.find_server(12000, b"abc"))
+print("all: %r" % beacon.find_all_servers(12000, b"abc"))

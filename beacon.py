@@ -5,7 +5,9 @@ Location is performed by UDB broadcasts.
 """
 
 import socket
+import select
 import threading
+import uuid
 
 try:
     import netifaces
@@ -18,6 +20,8 @@ except ImportError:
 
 CLIENT_TIMEOUT = 2
 SERVER_TIMEOUT = 0.2
+MAX_INTERFACE_SERVERS = 5  #: maximum count of beacons on a single interface
+UUID_LENGTH = 16
 
 ###########################################################################
 ###########################################################################
@@ -27,67 +31,83 @@ def get_broadcast_addresses():
     Retrieve broadcast addresses from network interfaces.
     """
     addr_list = []
-    for iface in netifaces.interfaces():
-        addresses = netifaces.ifaddresses(iface).get(netifaces.AF_INET)
-        if addresses is None:
-            continue
-        for address in addresses:
-            broadcast_addr = address.get("broadcast")
-            if broadcast_addr is None:
+    if HAS_NETIFACES:
+        for iface in netifaces.interfaces():
+            addresses = netifaces.ifaddresses(iface).get(netifaces.AF_INET)
+            if addresses is None:
                 continue
-            addr_list.append(broadcast_addr)
-    return addr_list
+            for address in addresses:
+                broadcast_addr = address.get("broadcast")
+                if broadcast_addr is None:
+                    continue
+                addr_list.append(broadcast_addr)
+    return ["127.0.0.1", "255.255.255.255", "<broadcast>"] + addr_list
 
 ###################################################################
 
-def _find_server(signal, bcast_addr, port, key, result_idx, results):
+def _find_servers(port, key, wait_for_all):
     """
-    stores to results (received data, address) or (None, None)
+    @return: list of resolved address
     """
-    bcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    bcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    bcast_sock.settimeout(CLIENT_TIMEOUT)
-    try:
-        bcast_sock.sendto(key, (bcast_addr, port))
-        results[result_idx] = bcast_sock.recvfrom(len(key))
-        signal.set()
-    except (socket.timeout, socket.error):
-        results[result_idx] = (None, None)
+    addresses = get_broadcast_addresses()
+
+    bcast_socks = []
+    for bcast_addr in addresses:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(key, (bcast_addr, port))
+        bcast_socks.append(sock)
+    
+    servers = []
+    srv_uuids = set()
+    max_tries = len(bcast_socks) * MAX_INTERFACE_SERVERS
+    while max_tries > 0:
+        try:
+            rlist, dummy_wlist, dummy_xlist = select.select(bcast_socks, [], [],
+                                                            CLIENT_TIMEOUT)
+        except socket.error:
+            break
+        if len(rlist) == 0:
+            # timeout, no respond
+            break
+
+        max_tries -= len(rlist)
+
+        try:
+            for bcast_sock in rlist:
+                message, (ip, dummy_port) = bcast_sock.recvfrom(UUID_LENGTH + len(key))
+                if len(message) < UUID_LENGTH:
+                    continue
+                srv_uuid = message[:UUID_LENGTH]
+                srv_key = message[UUID_LENGTH:]
+                if (srv_key == key) and (srv_uuid not in srv_uuids):
+                    servers.append(ip)
+                    srv_uuids.add(srv_uuid)
+                    if not wait_for_all:
+                        max_tries = 0
+                        break
+        except socket.error, e:
+            continue
+
+    return servers
+
+###################################################################
+
+def find_all_servers(port, key):
+    return _find_servers(port, key, True)
 
 ###################################################################
 
 def find_server(port, key):
     """
+    Find first responding server.
     @return: IP address or None if not found.
     """
-    # generic broadcast addresses
-    addresses = ["127.0.0.1", "255.255.255.255", "<broadcast>"]
-    if HAS_NETIFACES:
-        # broadcast addresses by interfaces
-        addresses += get_broadcast_addresses()
-
-    results = [(None, None)] * len(addresses)
-    threads = []
-    signal = threading.Event()
-
-    # perform parallel lookup on multiple addresses
-    for i, broadcast_addr in enumerate(addresses):
-        thr = threading.Thread(target=_find_server, name="find_server_%i" % i,
-                            args=(signal, broadcast_addr, port, key, i, results))
-        threads.append(thr)
-        thr.start()
-
-    # wait for the first thread that discovers the server
-    signal.wait(CLIENT_TIMEOUT)
-
-    # find correct result
-    for i, (rkey, addr) in enumerate(results):
-        if rkey == key:
-            return addr[0]  # IP part
-            # leave the rest of threads to rott
-
-    # no response or mole is among us (bad key)
-    return None
+    servers = _find_servers(port, key, False)
+    if len(servers) == 0:
+        return None
+    else:
+        return servers[0]
 
 ###########################################################################
 ###########################################################################
@@ -98,6 +118,7 @@ class Beacon(threading.Thread):
         self.port = port
         self.key = key
         self.quit = False
+        self.unique_id = uuid.uuid1().bytes
 
     ################################################
 
@@ -117,6 +138,6 @@ class Beacon(threading.Thread):
                 # not my client
                 continue
 
-            sock.sendto(self.key, address)
+            sock.sendto(self.unique_id + self.key, address)
 
         sock.close()
