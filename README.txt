@@ -8,3 +8,8 @@ Prerequisites
 =============
 - python 2.6+
 - netifaces (optional)
+
+Download
+========
+- packages at http://pypi.python.org/pypi/netbeacon
+- repository at https://github.com/dsiroky/netbeacon

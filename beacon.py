@@ -5,6 +5,7 @@ Location is performed by UDB broadcasts.
 """
 
 import socket
+import errno
 import select
 import threading
 import uuid
@@ -55,8 +56,12 @@ def _find_servers(port, key, wait_for_all):
     for bcast_addr in addresses:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(key, (bcast_addr, port))
-        bcast_socks.append(sock)
+        try:
+            sock.sendto(key, (bcast_addr, port))
+            bcast_socks.append(sock)
+        except socket.error, err:
+            if err.errno != errno.ENETUNREACH:
+                raise
     
     servers = []
     srv_uuids = set()
